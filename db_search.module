@@ -1,0 +1,336 @@
+<?php
+
+/**
+ * @file
+ * Do a global search on the database.
+ *
+ * Based on the script by: https://code.google.com/p/anywhereindb/
+ * @todo: Convert to using Drupal's database API.
+ */
+
+/**
+ * Implements hook_permission().
+ */
+function db_search_permission() {
+  return array(
+    'access database search' => array(
+      'title' => t('Access database search'),
+      'description' => t('WARNING: this allows access to search the entire database!'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_menu().
+ */
+function db_search_menu() {
+  $items = array();
+
+  $items['admin/reports/db-search'] = array(
+    'title' => 'Database search',
+    'page callback' => 'db_search_page',
+    'access arguments' => array('access database search'),
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Search form.
+ */
+function db_search_form($form, &$form_state) {
+
+  $form['search'] = array(
+    '#type' => 'textfield',
+    '#title' => t('String to search'),
+    '#required' => TRUE,
+  );
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Submit'),
+  );
+
+//  unset($_SESSION['db_search']['search_results']);
+  if (!empty($_SESSION['db_search']['search_results']) && is_array($_SESSION['db_search']['search_results'])) {
+    $form['results'] = empty($_SESSION['db_search']['search_results']) ? array() : $_SESSION['db_search']['search_results'];
+  }
+  unset($_SESSION['db_search']['search_results']);
+
+  return $form;
+}
+
+/**
+ * Search form submit handler.
+ */
+function db_search_form_submit($form, &$form_state) {
+  $search = $form_state['values']['search'];
+
+  drupal_set_message(t('Searching for "@search"', array(
+    '@search' => $search,
+  )));
+
+  global $databases;
+  $db_params = $databases['default']['default'];
+  $dbname = $db_params['database'];
+
+  $excluded_tables = array(
+    'apachesolr',
+    'batch',
+    'cache',
+    'node_access',
+    'node_type',
+    'queue',
+    'role',
+    'search',
+    'sessions',
+    'system',
+    'users',
+    'watchdog',
+  );
+
+  $batch = array(
+    'operations' => array(),
+    'finished' => '_db_search_finished',
+    'title' => t('Database Search'),
+    'init_message' => t('Database search is starting.'),
+    'progress_message' => t('Searched @current tables out of @total.'),
+    'error_message' => t('Database search has encountered an error.'),
+  );
+
+  $link = @mysql_connect($db_params['host'], $db_params['username'], $db_params['password']);
+  if (!$link) {
+    drupal_set_message(t('Database conection error.'));
+    return;
+  }
+  if(!@mysql_select_db($dbname, $link)) {
+    drupal_set_message(t('Database Not found.'));
+    return;
+  }
+  $search = mysql_real_escape_string($search);
+
+  // table count in the database
+  $sql = 'SHOW tables';
+  $res = mysql_query($sql);
+  //get all table information in row tables
+  $tables = _db_search_fetch_array($res);
+  $excluded = '/^(' . implode('|', $excluded_tables) . ').*$/';
+
+  mysql_close($link);
+
+  // for each table of the db seaching text
+  for ($i = 0; $i < sizeof($tables); $i++) {
+    $tablename = $tables[$i]['Tables_in_' . $dbname];
+
+    // Skip excluded tables.
+    if (preg_match($excluded, $tablename)) {
+      continue;
+    }
+    else {
+      $batch['operations'][] = array('_db_search_process', array($search, $tablename, sizeof($tables), $db_params));
+    }
+  }
+  batch_set($batch);
+}
+
+/**
+ * Page callback.
+ */
+function db_search_page() {
+  $page = array();
+
+  $page['search_form'] = drupal_get_form('db_search_form');
+
+  return $page;
+}
+
+function _db_search_process($search, $tablename, $total, $db_params, &$context) {
+  if (!isset($context['sandbox']['progress'])) {
+    $context['sandbox']['progress'] = 0;
+    $context['sandbox']['max'] = $total;
+    $context['results']['search_text'] = $search;
+  }
+
+  // Update progress information.
+  $context['sandbox']['progress']++;
+  if (!empty($context['sandbox']['current_table']) && $context['sandbox']['current_table'] == $tablename) {
+    return;
+  }
+  $context['sandbox']['current_table'] = $tablename;
+  $context['message'] = t('Now processing %table', array('%table' => $tablename));
+
+  // Database Connection
+  $dbname = $db_params['database'];
+  $link = @mysql_connect($db_params['host'], $db_params['username'], $db_params['password']);
+  if (!$link) {
+    drupal_set_message(t('Database conection error.'));
+    return;
+  }
+  if(!@mysql_select_db($dbname, $link)) {
+    drupal_set_message(t('Database Not found.'));
+    return;
+  }
+
+  $sql = 'SELECT COUNT(*) FROM ' . $tablename;
+  $res = mysql_query($sql);
+
+  //Buliding search Querry, search
+  if (mysql_num_rows($res) > 0) {
+    //taking the table data type information
+    $sql = 'desc ' . $tablename;
+    $res = mysql_query($sql);
+    $collum = _db_search_fetch_array($res);
+
+    $search_sql = 'SELECT * FROM ' . $tablename . ' WHERE ';
+    $no_varchar_field = 0;
+
+    // only finding each row information
+    for ($j = 0; $j < sizeof($collum); $j++) {
+      // we are searching all the fields in this table
+      if ($no_varchar_field != 0) {
+        $search_sql .= ' OR ';
+      }
+      $search_sql .= '`' . $collum[$j]['Field'] . '` LIKE \'%' . $search . '%\' ';
+      $no_varchar_field++;
+
+    }
+
+    // only main searching part showing the data
+    if ($no_varchar_field > 0) {
+      $res = mysql_query($search_sql);
+      $search_result = _db_search_fetch_array($res);
+
+      // found search data showing it
+      if (sizeof($search_result)) {
+        $total = mysql_affected_rows();
+
+        $context['results'][$tablename] = array(
+          '#type' => 'container',
+          '#attributes' => array('class' => array('db-search-result-item-header')),
+          'header-text' => array(
+            '#type' => 'markup',
+            '#markup' => t('Table: %table<br>Total results: %total', array(
+              '%table' => $tablename,
+              '%total' => $total,
+            )),
+          ),
+        );
+
+        $column_names = array_keys($search_result[0]);
+        $column_names[] = t('Link');
+
+        foreach ($search_result as &$data) {
+          foreach ($data as &$field) {
+            $field = _db_search_format_result_text($field, $search);
+          }
+          $data['_db_search_link'] = '';
+          if (isset($data['entity_type']) && isset($data['entity_id'])) {
+            $data['_db_search_link'] = _db_search_create_link($data['entity_type'], $data['entity_id'], $data);
+          }
+        }
+
+        $context['results'][$tablename]['table-results'] = array(
+          '#type' => 'markup',
+          '#markup' => theme('table', array(
+            'header' => $column_names,
+            'rows' => $search_result,
+            'empty' => t('No results.'),
+          ))
+        );
+      }
+
+    }
+  }
+
+  mysql_close($link);
+
+  // Inform the batch engine if we are not finished.
+  if ($context['sandbox']['progress'] != $context['sandbox']['max']) {
+    $context['finished'] = $context['sandbox']['progress'] / $context['sandbox']['max'];
+  }
+}
+
+function _db_search_finished($success, $results, $operations) {
+  if ($success) {
+    $res['header'] = array(
+      '#type' => 'container',
+      '#attributes' => array('class' => array('db-search-results-header')),
+      'header-text' => array(
+        '#type' => 'markup',
+        '#markup' => t('Results for: %search', array('%search' => $results['search_text'])),
+      ),
+    );
+    unset($results['search_text']);
+
+    if (empty($results)) {
+      $res['results-text']['error-text'] = array(
+        '#type' => 'markup',
+        '#markup' => t('Sorry, string not found in this database.'),
+      );
+    }
+    else {
+      $res['results-text'] = array(
+        '#type' => 'container',
+        '#attributes' => array('class' => array('db-search-results-results')),
+        'results-tables' => $results,
+      );
+    }
+    $_SESSION['db_search']['search_results'] = $res;
+  }
+  else {
+    // An error occurred.
+    $error_operation = reset($operations);
+    unset($error_operation[1][3]);
+    $message = t('An error occurred while processing %error_operation with arguments: @arguments', array('%error_operation' => $error_operation[0], '@arguments' => print_r($error_operation[1], TRUE)));
+    drupal_set_message($message, 'error');
+  }
+
+}
+
+// Helper functions.
+
+// @method    fetch_array
+// taking the mySQL $resource id and fetch and return the result array
+// @param   string| MySQL resouser
+// @return  array
+function _db_search_fetch_array($res) {
+  $data = array();
+  while ($row = mysql_fetch_assoc($res)) {
+    $data[] = $row;
+  }
+  return $data;
+}
+
+function _db_search_format_result_text($text, $search_text) {
+  $search = preg_quote($search_text);
+  $plain = htmlspecialchars($text);
+  $matches = array();
+  $total = preg_match_all('/(.{0,100}' . $search . '.{0,100})/i', $plain, $matches);
+
+  if ($total && !empty($matches[1])) {
+    $result = implode('<br>', $matches[1]);
+    $result = preg_replace("|($search_text)|Ui", "<b>$1</b>", $result);
+    return '...' . $result . '...';
+  }
+  return (strlen($plain) > 300) ? substr($plain, 0, 300) . '...' : $plain;
+}
+
+function _db_search_create_link($entity_type, $entity_id, $raw = array()) {
+  switch ($entity_type) {
+    case 'node':
+      return l('link', 'node/' . $entity_id, array('alias' => TRUE));
+      break;
+    case 'field_collection_item':
+      if (isset($raw['bundle'])) {
+        $res = mysql_query("SELECT * FROM field_data_{$raw['bundle']}  WHERE {$raw['bundle']}_value = {$entity_id} LIMIT 1;");
+        $res = mysql_fetch_assoc($res);
+        return _db_search_create_link($res['entity_type'], $res['entity_id'], $res);
+      }
+      break;
+    case 'fieldable_panels_pane':
+      return l('link', 'admin/structure/fieldable-panels-panes/view/' . $entity_id, array('alias' => TRUE));
+      break;
+  }
+  return '';
+}

@@ -1,0 +1,4 @@
+name = Database Search
+description = "Perform a global search in the database."
+core = 7.x
+package = Extra
